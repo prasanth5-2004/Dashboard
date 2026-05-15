@@ -22,7 +22,6 @@ namespace MQTT_STA_Updater
         static readonly object lockObj = new();
 
         // ── DEDUPLICATION TRACKING ──
-        // For water topic: tracks per-deviceId to allow Feed and Concentrate to be different payloads
         static Dictionary<string, Dictionary<long, DateTime>> ProcessedDeviceEpochs = new();
         static Dictionary<long, DateTime> ProcessedAirEpochs = new();
 
@@ -31,16 +30,19 @@ namespace MQTT_STA_Updater
         static Dictionary<long, FlushedRecord> FlushedSoloRecords = new();
 
         // ── DISTILLERY BUFFER (mode 4): waits for all 3 payloads ──
-        // Keyed by epochTime. Accumulates FeedFlow, ConcentrateFlow, SPM.
         static Dictionary<long, DistilleryBuffer> DistilleryBufferMap = new();
+        static Dictionary<long, DistilleryFlushedRecord> DistilleryFlushedRecords = new();
+
+        // ── UNIT2 BUFFER (mode 5): pairs ETP water + CWF air ──
+        static Dictionary<long, Unit2Buffer> Unit2BufferMap = new();
+        static Dictionary<long, Unit2FlushedRecord> Unit2FlushedRecords = new();
 
         static System.Timers.Timer FlushTimer = new();
 
-        static int FlushDelaySeconds = 900;   // 15 min wait for partner
-        static int EpochMatchWindowSeconds = 1800;  // 30 min fuzzy match for late arrivals
-        static int LateArrivalWindowSeconds = 3600; // 1 hour late-arrival UPDATE window
+        static int FlushDelaySeconds = 900;
+        static int EpochMatchWindowSeconds = 1800;
+        static int LateArrivalWindowSeconds = 3600;
 
-        // ── RECONNECTION: store options and client at class level ──────────────
         static MqttClientOptions? MqttOptions = null;
         static IMqttClient? MqttClient = null;
 
@@ -49,11 +51,22 @@ namespace MQTT_STA_Updater
             Console.Title = "MQTT → STA/Text + Access DB (Combined Rows)";
             LoadConfig();
 
-            var WaterMapping = Config.water_parameters!
-                .ToDictionary(k => k.Value.deviceId!, v => (v.Value.nmes!, v.Key));
+            // ── FIX: Mode 5 does not use WaterMapping/AirMapping (parsed by parameter name).
+            //         Modes 0-4 require unique deviceId per parameter for STA file updates.
+            //         Guard dictionary construction to avoid ArgumentException on duplicate keys.
+            var WaterMapping = new Dictionary<string, (string nmes, string name)>();
+            var AirMapping = new Dictionary<string, (string nmes, string name)>();
 
-            var AirMapping = Config.air_parameters!
-                .ToDictionary(k => k.Value.deviceId!, v => (v.Value.nmes!, v.Key));
+            if (Config.output_mode != 5)
+            {
+                if (Config.water_parameters != null)
+                    WaterMapping = Config.water_parameters
+                        .ToDictionary(k => k.Value.deviceId!, v => (v.Value.nmes!, v.Key));
+
+                if (Config.air_parameters != null)
+                    AirMapping = Config.air_parameters
+                        .ToDictionary(k => k.Value.deviceId!, v => (v.Value.nmes!, v.Key));
+            }
 
             FlushTimer = new System.Timers.Timer(60 * 1000);
             FlushTimer.Elapsed += FlushOldBufferedData;
@@ -74,32 +87,55 @@ namespace MQTT_STA_Updater
                     Console.WriteLine($"\n=== RECEIVED [{topic}] ===");
                     Console.ResetColor();
 
-                    var (newValues, epochTime) = ParsePayload(payload);
+                    // ── MODE 5: UNIT 2 uses a different payload format ─────────────────
+                    if (Config.output_mode == 5)
+                    {
+                        var (newValues, epochTime, stationId, deviceId) = ParsePayloadUnit2(payload);
 
-                    if (newValues.Count == 0)
+                        if (newValues.Count == 0)
+                        {
+                            Console.WriteLine("⚠ No usable data in payload");
+                            return;
+                        }
+
+                        if (epochTime == 0)
+                        {
+                            Console.ForegroundColor = ConsoleColor.Magenta;
+                            Console.WriteLine("⚠ No timestamp in payload, using current time");
+                            Console.ResetColor();
+                            epochTime = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                        }
+
+                        bool isWaterTopic = (topic == Config.mqtt!.topic_water);
+                        HandleUnit2(epochTime, newValues, stationId, deviceId, isWaterTopic);
+                        return;
+                    }
+
+                    // ── ALL OTHER MODES: original payload format ───────────────────────
+                    var (newValuesStd, epochTimeStd) = ParsePayload(payload);
+
+                    if (newValuesStd.Count == 0)
                     {
                         Console.WriteLine("⚠ No usable data in payload");
                         return;
                     }
 
-                    if (epochTime == 0)
+                    if (epochTimeStd == 0)
                     {
                         Console.ForegroundColor = ConsoleColor.Magenta;
                         Console.WriteLine("⚠ No timestamp in payload, using current time");
                         Console.ResetColor();
-                        epochTime = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                        epochTimeStd = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                     }
 
-                    bool isWaterTopic = (topic == Config.mqtt!.topic_water);
+                    bool isWater = (topic == Config.mqtt!.topic_water);
 
-                    // ── MODE 4: DISTILLERY ─────────────────────────────────────────────────
+                    // ── MODE 4: DISTILLERY ─────────────────────────────────────────────
                     if (Config.output_mode == 4)
                     {
-                        if (isWaterTopic)
+                        if (isWater)
                         {
-                            // Each water payload carries exactly ONE deviceId (Feed OR Concentrate).
-                            // Deduplicate per deviceId+epoch independently.
-                            var distilleryWaterValues = newValues
+                            var distilleryWaterValues = newValuesStd
                                 .Where(x => x.Key == "Evaporator_Feed_Flow" || x.Key == "Evaporator_Concentrate_Flow")
                                 .ToDictionary(x => x.Key, x => x.Value);
 
@@ -109,14 +145,13 @@ namespace MQTT_STA_Updater
                                 return;
                             }
 
-                            // Check duplicates for each deviceId separately
                             var nonDuplicates = new Dictionary<string, double>();
                             foreach (var kv in distilleryWaterValues)
                             {
-                                if (IsDeviceDuplicate(kv.Key, epochTime))
+                                if (IsDeviceDuplicate(kv.Key, epochTimeStd))
                                 {
                                     Console.ForegroundColor = ConsoleColor.Red;
-                                    Console.WriteLine($"❌ DUPLICATE: {kv.Key} epoch={epochTime} — skipping");
+                                    Console.WriteLine($"❌ DUPLICATE: {kv.Key} epoch={epochTimeStd} — skipping");
                                     Console.ResetColor();
                                 }
                                 else
@@ -131,15 +166,15 @@ namespace MQTT_STA_Updater
                             {
                                 foreach (var kv in nonDuplicates)
                                     LastValues[kv.Key] = kv.Value;
-                                LastEpochTime = epochTime;
+                                LastEpochTime = epochTimeStd;
                             }
 
                             UpdateTextFileDistillery(Config.files!.display_text_distillery!, LastValues);
-                            BufferDistillery(epochTime, nonDuplicates, isAir: false);
+                            BufferDistillery(epochTimeStd, nonDuplicates, isAir: false);
                         }
-                        else // air topic
+                        else
                         {
-                            var distilleryAirValues = newValues
+                            var distilleryAirValues = newValuesStd
                                 .Where(x => x.Key == "Boiler_Stack_SPM")
                                 .ToDictionary(x => x.Key, x => x.Value);
 
@@ -149,10 +184,10 @@ namespace MQTT_STA_Updater
                                 return;
                             }
 
-                            if (IsDeviceDuplicate("Boiler_Stack_SPM", epochTime))
+                            if (IsDeviceDuplicate("Boiler_Stack_SPM", epochTimeStd))
                             {
                                 Console.ForegroundColor = ConsoleColor.Red;
-                                Console.WriteLine($"❌ DUPLICATE: Boiler_Stack_SPM epoch={epochTime} — skipping");
+                                Console.WriteLine($"❌ DUPLICATE: Boiler_Stack_SPM epoch={epochTimeStd} — skipping");
                                 Console.ResetColor();
                                 return;
                             }
@@ -161,23 +196,23 @@ namespace MQTT_STA_Updater
                             {
                                 foreach (var kv in distilleryAirValues)
                                     LastValues[kv.Key] = kv.Value;
-                                LastEpochTime = epochTime;
+                                LastEpochTime = epochTimeStd;
                             }
 
                             UpdateTextFileDistillery(Config.files!.display_text_distillery!, LastValues);
-                            BufferDistillery(epochTime, distilleryAirValues, isAir: true);
+                            BufferDistillery(epochTimeStd, distilleryAirValues, isAir: true);
                         }
 
-                        return; // mode 4 handled, exit handler
+                        return;
                     }
 
-                    // ── MODES 0-3 ──────────────────────────────────────────────────────────
-                    if (IsDuplicate(epochTime, isWaterTopic))
+                    // ── MODES 0-3 ──────────────────────────────────────────────────────
+                    if (IsDuplicate(epochTimeStd, isWater))
                     {
                         Console.ForegroundColor = ConsoleColor.Red;
                         Console.WriteLine($"❌ DUPLICATE PAYLOAD DETECTED!");
                         Console.WriteLine($"   Topic: {topic}");
-                        Console.WriteLine($"   Epoch: {epochTime} ({DateTimeOffset.FromUnixTimeSeconds(epochTime).LocalDateTime:yyyy-MM-dd HH:mm:ss})");
+                        Console.WriteLine($"   Epoch: {epochTimeStd} ({DateTimeOffset.FromUnixTimeSeconds(epochTimeStd).LocalDateTime:yyyy-MM-dd HH:mm:ss})");
                         Console.WriteLine($"   → SKIPPING to prevent duplicate DB insert");
                         Console.ResetColor();
                         return;
@@ -185,15 +220,14 @@ namespace MQTT_STA_Updater
 
                     lock (lockObj)
                     {
-                        foreach (var kv in newValues)
+                        foreach (var kv in newValuesStd)
                             LastValues[kv.Key] = kv.Value;
-                        LastEpochTime = epochTime;
+                        LastEpochTime = epochTimeStd;
                     }
 
-                    // ===== WATER (modes 0-3) =====
-                    if (isWaterTopic)
+                    if (isWater)
                     {
-                        var waterValues = newValues
+                        var waterValues = newValuesStd
                             .Where(x => x.Key.StartsWith("ETP_Outlet_"))
                             .ToDictionary(x => x.Key, x => x.Value);
 
@@ -212,18 +246,17 @@ namespace MQTT_STA_Updater
                         if (Config.output_mode == 3)
                             UpdateTextFileUnit5(Config.files!.display_text_unit5!, LastValues, hasWater: true, hasAir: false);
 
-                        BufferData(epochTime, waterValues, isWater: true);
+                        BufferData(epochTimeStd, waterValues, isWater: true);
                     }
-                    // ===== AIR (modes 0-3) =====
                     else if (topic == Config.mqtt!.topic_air)
                     {
-                        Console.WriteLine($"DEBUG: Received {newValues.Count} total values");
-                        foreach (var kv in newValues)
+                        Console.WriteLine($"DEBUG: Received {newValuesStd.Count} total values");
+                        foreach (var kv in newValuesStd)
                             Console.WriteLine($"  DeviceID: {kv.Key}");
 
                         if (Config.output_mode == 3)
                         {
-                            var cogenerationValues = newValues
+                            var cogenerationValues = newValuesStd
                                 .Where(x => x.Key.StartsWith("Cogeneration_Stack_"))
                                 .ToDictionary(x => x.Key, x => x.Value);
 
@@ -243,12 +276,12 @@ namespace MQTT_STA_Updater
 
                             UpdateStaFile(Config.files!.air!, AirMapping, LastValues);
                             UpdateTextFileUnit5(Config.files!.display_text_unit5!, LastValues, hasWater: false, hasAir: true);
-                            BufferData(epochTime, normalizedValues, isWater: false);
+                            BufferData(epochTimeStd, normalizedValues, isWater: false);
                             return;
                         }
 
                         var normalizedAirValues = new Dictionary<string, double>();
-                        foreach (var kv in newValues)
+                        foreach (var kv in newValuesStd)
                         {
                             if (kv.Key.StartsWith("Cogeneration_Stack_"))
                             {
@@ -274,7 +307,7 @@ namespace MQTT_STA_Updater
                         if (Config.output_mode == 1 || Config.output_mode == 2)
                             UpdateTextFileUnit1(Config.files!.display_text_unit1!, LastValues, hasWater: false, hasAir: true);
 
-                        BufferData(epochTime, normalizedAirValues, isWater: false);
+                        BufferData(epochTimeStd, normalizedAirValues, isWater: false);
                     }
                 }
                 catch (Exception ex)
@@ -286,7 +319,6 @@ namespace MQTT_STA_Updater
                 }
             };
 
-            // ── CHANGE 1: Store options at class level, add KeepAlive + CleanSession ──
             MqttOptions = new MqttClientOptionsBuilder()
                 .WithTcpServer(Config.mqtt!.broker, Config.mqtt.port)
                 .WithClientId("STA-DB-" + Environment.MachineName)
@@ -296,7 +328,6 @@ namespace MQTT_STA_Updater
 
             MqttClient = mqttClient;
 
-            // ── CHANGE 2: Reconnection handler ───────────────────────────────────────
             mqttClient.DisconnectedAsync += async e =>
             {
                 Console.ForegroundColor = ConsoleColor.Red;
@@ -315,7 +346,6 @@ namespace MQTT_STA_Updater
                         Console.WriteLine($"  Reconnect attempt #{attempt}...");
                         await mqttClient.ConnectAsync(MqttOptions);
 
-                        // Re-subscribe after reconnect
                         await mqttClient.SubscribeAsync(Config.mqtt.topic_water!);
                         await mqttClient.SubscribeAsync(Config.mqtt.topic_air!);
 
@@ -347,6 +377,7 @@ namespace MQTT_STA_Updater
                 2 => "STA + Text File (Unit 1)",
                 3 => "Text File (Unit 5) Only - Cogeneration",
                 4 => "Text File (Distillery) Only",
+                5 => "Unit 2 — ETP Outlet + CWF/CSW DB",
                 _ => "Unknown"
             };
             Console.WriteLine($"✓ Output Mode: {modeText}");
@@ -358,10 +389,519 @@ namespace MQTT_STA_Updater
             Console.WriteLine("✓ Auto-reconnect enabled (keepalive=30s, retry every 10s)");
             if (Config.output_mode == 4)
                 Console.WriteLine("✓ Distillery mode: waiting for Feed Flow + Concentrate Flow + SPM per epoch");
+            if (Config.output_mode == 5)
+                Console.WriteLine("✓ Unit 2 mode: pairing ETP water data with CWF/CSW air data per epoch");
             Console.WriteLine("✓ Waiting for data...\n");
             Console.ResetColor();
 
             await Task.Delay(-1);
+        }
+
+        // ═════════════════════════════════════════════════════════════════════
+        //  MODE 5 — UNIT 2
+        //  Payload format: { "data": [ { "stationId": "...", "device_data": [ {
+        //    "deviceId": "...", "params": [ { "parameter": "...", "value": ...,
+        //    "timestamp": ... } ] } ] } ] }
+        //
+        //  Water topic  → StationID 1 / DeviceID 1 → Flow, pH, TSS, BOD, COD
+        //  Air topic    → StationID 2 / DeviceID 2 → Flow(CWF), MassFlow(CSW)
+        // ═════════════════════════════════════════════════════════════════════
+
+        static (Dictionary<string, double> values, long epochTime, string stationId, string deviceId)
+            ParsePayloadUnit2(string raw)
+        {
+            var result = new Dictionary<string, double>();
+            long epochTime = 0;
+            string stationId = "";
+            string deviceId = "";
+
+            if (string.IsNullOrWhiteSpace(raw)) return (result, epochTime, stationId, deviceId);
+
+            try
+            {
+                using var doc = JsonDocument.Parse(raw);
+                var root = doc.RootElement;
+
+                // Support both { "data": [...] } and bare array
+                JsonElement dataArray;
+                if (root.ValueKind == JsonValueKind.Object && root.TryGetProperty("data", out var dataProp))
+                    dataArray = dataProp;
+                else if (root.ValueKind == JsonValueKind.Array)
+                    dataArray = root;
+                else
+                {
+                    Console.WriteLine("⚠ Unit 2 payload: unexpected JSON structure");
+                    return (result, epochTime, stationId, deviceId);
+                }
+
+                foreach (var station in dataArray.EnumerateArray())
+                {
+                    if (station.TryGetProperty("stationId", out var stationEl))
+                        stationId = stationEl.GetString() ?? "";
+
+                    if (!station.TryGetProperty("device_data", out var deviceData)) continue;
+
+                    foreach (var device in deviceData.EnumerateArray())
+                    {
+                        if (device.TryGetProperty("deviceId", out var devEl))
+                            deviceId = devEl.GetString() ?? "";
+
+                        if (!device.TryGetProperty("params", out var paramsList)) continue;
+
+                        foreach (var param in paramsList.EnumerateArray())
+                        {
+                            // Extract timestamp (milliseconds → seconds)
+                            if (epochTime == 0 && param.TryGetProperty("timestamp", out var tsEl))
+                                epochTime = ExtractEpochTime(tsEl);
+
+                            if (!param.TryGetProperty("parameter", out var paramNameEl)) continue;
+                            if (!param.TryGetProperty("value", out var valueEl)) continue;
+
+                            string paramName = paramNameEl.GetString() ?? "";
+
+                            double val;
+                            if (valueEl.ValueKind == JsonValueKind.Number)
+                                val = valueEl.GetDouble();
+                            else if (valueEl.ValueKind == JsonValueKind.String)
+                            {
+                                if (!double.TryParse(valueEl.GetString(),
+                                    System.Globalization.NumberStyles.Any,
+                                    System.Globalization.CultureInfo.InvariantCulture, out val))
+                                    continue;
+                            }
+                            else continue;
+
+                            // Map parameter names → internal keys
+                            string key = paramName.ToLowerInvariant() switch
+                            {
+                                "cod" => "Unit2_COD",
+                                "bod" => "Unit2_BOD",
+                                "ph" => "Unit2_pH",
+                                "tss" => "Unit2_TSS",
+                                "flow" => "Unit2_Flow",        // ETP outlet flow (water topic)
+                                "mass_flow" => "Unit2_MassFlow",    // CSW (air topic)
+                                _ => ""
+                            };
+
+                            if (string.IsNullOrEmpty(key))
+                            {
+                                Console.WriteLine($"  ⚠ Unknown parameter '{paramName}' — skipped");
+                                continue;
+                            }
+
+                            result[key] = val;
+                            Console.WriteLine($"  {paramName} ({key}) = {val}");
+                        }
+                    }
+                }
+
+                if (epochTime > 0)
+                {
+                    var dt = DateTimeOffset.FromUnixTimeSeconds(epochTime).LocalDateTime;
+                    Console.ForegroundColor = ConsoleColor.Cyan;
+                    Console.WriteLine($"  📅 Payload Timestamp: {dt:yyyy-MM-dd HH:mm:ss} (Epoch: {epochTime})");
+                    Console.ResetColor();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Unit2 parse error: " + ex.Message);
+            }
+
+            return (result, epochTime, stationId, deviceId);
+        }
+
+        static void HandleUnit2(long epochTime, Dictionary<string, double> values,
+            string stationId, string deviceId, bool isWaterTopic)
+        {
+            // For the air topic, "Unit2_Flow" is actually CWF (not ETP flow).
+            // Rename it so it doesn't collide with the water-side ETP flow.
+            if (!isWaterTopic && values.ContainsKey("Unit2_Flow"))
+            {
+                values["Unit2_FlowCWF"] = values["Unit2_Flow"];
+                values.Remove("Unit2_Flow");
+            }
+
+            // Deduplicate per side
+            string dedupKey = isWaterTopic ? "__unit2_water__" : "__unit2_air__";
+            if (IsDeviceDuplicate(dedupKey, epochTime))
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"❌ DUPLICATE Unit2 {(isWaterTopic ? "WATER" : "AIR")} epoch={epochTime} — skipping");
+                Console.ResetColor();
+                return;
+            }
+
+            lock (lockObj)
+            {
+                foreach (var kv in values)
+                    LastValues[kv.Key] = kv.Value;
+                LastEpochTime = epochTime;
+            }
+
+            // Optional: update display text file for Unit 2
+            if (!string.IsNullOrEmpty(Config.files?.display_text_unit2))
+                UpdateTextFileUnit2(Config.files.display_text_unit2, LastValues);
+
+            BufferUnit2(epochTime, values, stationId, deviceId, isWaterTopic);
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  BufferUnit2 — waits for water + air before inserting
+        // ─────────────────────────────────────────────────────────────────────
+        static void BufferUnit2(long epochTime, Dictionary<string, double> values,
+            string stationId, string deviceId, bool isWaterTopic)
+        {
+            lock (lockObj)
+            {
+                string side = isWaterTopic ? "WATER" : "AIR";
+
+                // PATH 1: Exact-epoch match in active buffer
+                if (Unit2BufferMap.TryGetValue(epochTime, out var existing))
+                {
+                    bool waitingForThisSide = isWaterTopic ? !existing.HasWater : !existing.HasAir;
+                    if (waitingForThisSide)
+                    {
+                        MergeUnit2Buffer(existing, values, stationId, deviceId, isWaterTopic);
+                        Console.ForegroundColor = ConsoleColor.Cyan;
+                        Console.WriteLine($"  🔗 Unit2 {side} matched existing buffer (exact epoch={epochTime})");
+                        Console.ResetColor();
+
+                        double waited = (DateTime.Now - existing.ReceivedAt).TotalSeconds;
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine($"  ✓ COMPLETE: Water+Air paired. Waited {waited:0.0}s.");
+                        Console.ResetColor();
+
+                        FlushUnit2Buffer(epochTime, existing);
+                        Unit2BufferMap.Remove(epochTime);
+                        return;
+                    }
+                }
+
+                // PATH 2: Fuzzy match within EpochMatchWindowSeconds
+                Unit2Buffer? fuzzyMatch = null;
+                long fuzzyKey = 0;
+                foreach (var kv in Unit2BufferMap)
+                {
+                    long diff = Math.Abs(kv.Key - epochTime);
+                    bool waitingForThisSide = isWaterTopic ? !kv.Value.HasWater : !kv.Value.HasAir;
+                    if (diff > 0 && diff <= EpochMatchWindowSeconds && waitingForThisSide)
+                    {
+                        if (fuzzyMatch == null || diff < Math.Abs(fuzzyKey - epochTime))
+                        {
+                            fuzzyMatch = kv.Value;
+                            fuzzyKey = kv.Key;
+                        }
+                    }
+                }
+
+                if (fuzzyMatch != null)
+                {
+                    long diff = Math.Abs(fuzzyKey - epochTime);
+                    Console.ForegroundColor = ConsoleColor.Cyan;
+                    Console.WriteLine($"  🔗 Unit2 {side}: fuzzy match (diff={diff}s) merged into buffer (bufferEpoch={fuzzyKey})");
+                    Console.ResetColor();
+                    MergeUnit2Buffer(fuzzyMatch, values, stationId, deviceId, isWaterTopic);
+
+                    if (fuzzyMatch.HasWater && fuzzyMatch.HasAir)
+                    {
+                        FlushUnit2Buffer(fuzzyKey, fuzzyMatch);
+                        Unit2BufferMap.Remove(fuzzyKey);
+                    }
+                    return;
+                }
+
+                // PATH 3: Late arrival — already flushed solo
+                Unit2FlushedRecord? flushedMatch = null;
+                long flushedKey = 0;
+                foreach (var kv in Unit2FlushedRecords)
+                {
+                    long diff = Math.Abs(kv.Key - epochTime);
+                    bool missingThisSide = isWaterTopic ? !kv.Value.HasWater : !kv.Value.HasAir;
+                    if (diff <= EpochMatchWindowSeconds && missingThisSide)
+                    {
+                        if (flushedMatch == null || diff < Math.Abs(flushedKey - epochTime))
+                        {
+                            flushedMatch = kv.Value;
+                            flushedKey = kv.Key;
+                        }
+                    }
+                }
+
+                if (flushedMatch != null)
+                {
+                    long diff = Math.Abs(flushedKey - epochTime);
+                    Console.ForegroundColor = ConsoleColor.Magenta;
+                    Console.WriteLine($"\n  ⚡ LATE ARRIVAL (Unit2): {side} (epoch={epochTime}) matched flushed record (epoch={flushedKey}, diff={diff}s) → UPDATE");
+                    Console.ResetColor();
+
+                    foreach (var kv in values) flushedMatch.Values[kv.Key] = kv.Value;
+                    if (isWaterTopic)
+                    {
+                        flushedMatch.StationID1 = stationId;
+                        flushedMatch.DeviceID1 = deviceId;
+                        flushedMatch.HasWater = true;
+                    }
+                    else
+                    {
+                        flushedMatch.StationID2 = stationId;
+                        flushedMatch.DeviceID2 = deviceId;
+                        flushedMatch.HasAir = true;
+                    }
+
+                    UpdateUnit2Row(flushedMatch.Values, flushedKey,
+                        flushedMatch.StationID1, flushedMatch.DeviceID1,
+                        flushedMatch.StationID2, flushedMatch.DeviceID2,
+                        flushedMatch.HasWater, flushedMatch.HasAir);
+                    Unit2FlushedRecords[flushedKey] = flushedMatch;
+                    return;
+                }
+
+                // PATH 4: New buffer entry
+                var newBuf = new Unit2Buffer
+                {
+                    EpochTime = epochTime,
+                    ReceivedAt = DateTime.Now
+                };
+                MergeUnit2Buffer(newBuf, values, stationId, deviceId, isWaterTopic);
+                Unit2BufferMap[epochTime] = newBuf;
+
+                string arrivedKeys = string.Join(", ", values.Keys);
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine($"  🔵 Unit2 {side} buffered [{arrivedKeys}] (epoch={epochTime}) — waiting {FlushDelaySeconds}s for partner...");
+                Console.ResetColor();
+            }
+        }
+
+        static void MergeUnit2Buffer(Unit2Buffer buf, Dictionary<string, double> values,
+            string stationId, string deviceId, bool isWaterTopic)
+        {
+            foreach (var kv in values) buf.Values[kv.Key] = kv.Value;
+            if (isWaterTopic)
+            {
+                buf.HasWater = true;
+                buf.StationID1 = stationId;
+                buf.DeviceID1 = deviceId;
+            }
+            else
+            {
+                buf.HasAir = true;
+                buf.StationID2 = stationId;
+                buf.DeviceID2 = deviceId;
+            }
+        }
+
+        static void FlushUnit2Buffer(long epochTime, Unit2Buffer buf)
+        {
+            // Must be called inside lockObj
+            InsertUnit2(buf.Values, epochTime,
+                buf.StationID1, buf.DeviceID1,
+                buf.StationID2, buf.DeviceID2,
+                buf.HasWater, buf.HasAir);
+
+            if (!(buf.HasWater && buf.HasAir))
+            {
+                var flushed = new Unit2FlushedRecord
+                {
+                    EpochTime = epochTime,
+                    FlushedAt = DateTime.Now,
+                    HasWater = buf.HasWater,
+                    HasAir = buf.HasAir,
+                    StationID1 = buf.StationID1,
+                    DeviceID1 = buf.DeviceID1,
+                    StationID2 = buf.StationID2,
+                    DeviceID2 = buf.DeviceID2
+                };
+                foreach (var kv in buf.Values) flushed.Values[kv.Key] = kv.Value;
+                Unit2FlushedRecords[epochTime] = flushed;
+
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"  📋 Unit2 solo record registered for late-arrival UPDATE (epoch={epochTime}, window={LateArrivalWindowSeconds}s)");
+                Console.ResetColor();
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  InsertUnit2
+        //  Schema: ID | DateTime | EpochTime | StationID 1 | DeviceID 1 |
+        //          Flow | pH | TSS | BOD | COD |
+        //          StationID 2 | DeviceID 2 | Flow(CWF) | MassFlow(CSW)
+        // ─────────────────────────────────────────────────────────────────────
+        static void InsertUnit2(Dictionary<string, double> values, long epochTime,
+            string stationId1, string deviceId1,
+            string stationId2, string deviceId2,
+            bool hasWater, bool hasAir)
+        {
+            try
+            {
+                // ── Use connection_string_unit2 if provided, else fall back to connection_string
+                string connStr = !string.IsNullOrEmpty(Config.database?.connection_string_unit2)
+                    ? Config.database.connection_string_unit2
+                    : Config.database!.connection_string!;
+
+                using var con = new OleDbConnection(connStr);
+                con.Open();
+
+                DateTime measurementTime = epochTime > 0
+                    ? DateTimeOffset.FromUnixTimeSeconds(epochTime).LocalDateTime
+                    : DateTime.Now;
+
+                try
+                {
+                    string sql = @"
+INSERT INTO RawData
+([DateTime], [EpochTime],
+ [StationID 1], [DeviceID 1], [Flow], [pH], [TSS], [BOD], [COD],
+ [StationID 2], [DeviceID 2], [Flow(CWF)], [MassFlow(CSW)])
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+                    using var cmd = new OleDbCommand(sql, con);
+                    cmd.Parameters.Add("DT", OleDbType.Date).Value = measurementTime;
+                    cmd.Parameters.Add("Ep", OleDbType.Double).Value = (double)epochTime;
+
+                    cmd.Parameters.Add("S1", OleDbType.VarChar).Value = hasWater ? stationId1 : (object)DBNull.Value;
+                    cmd.Parameters.Add("D1", OleDbType.VarChar).Value = hasWater ? deviceId1 : (object)DBNull.Value;
+                    cmd.Parameters.Add("Fl", OleDbType.Double).Value = values.TryGetValue("Unit2_Flow", out var fl) ? fl : (object)DBNull.Value;
+                    cmd.Parameters.Add("PH", OleDbType.Double).Value = values.TryGetValue("Unit2_pH", out var ph) ? ph : (object)DBNull.Value;
+                    cmd.Parameters.Add("TS", OleDbType.Double).Value = values.TryGetValue("Unit2_TSS", out var tss) ? tss : (object)DBNull.Value;
+                    cmd.Parameters.Add("BD", OleDbType.Double).Value = values.TryGetValue("Unit2_BOD", out var bod) ? bod : (object)DBNull.Value;
+                    cmd.Parameters.Add("CD", OleDbType.Double).Value = values.TryGetValue("Unit2_COD", out var cod) ? cod : (object)DBNull.Value;
+
+                    cmd.Parameters.Add("S2", OleDbType.VarChar).Value = hasAir ? stationId2 : (object)DBNull.Value;
+                    cmd.Parameters.Add("D2", OleDbType.VarChar).Value = hasAir ? deviceId2 : (object)DBNull.Value;
+                    cmd.Parameters.Add("CWF", OleDbType.Double).Value = values.TryGetValue("Unit2_FlowCWF", out var cwf) ? cwf : (object)DBNull.Value;
+                    cmd.Parameters.Add("CSW", OleDbType.Double).Value = values.TryGetValue("Unit2_MassFlow", out var csw) ? csw : (object)DBNull.Value;
+
+                    cmd.ExecuteNonQuery();
+
+                    string dataType = (hasWater && hasAir) ? "COMBINED" : hasWater ? "Water Only" : "Air Only";
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"✓ DB INSERT OK (Unit2 {dataType}) - Time: {measurementTime:yyyy-MM-dd HH:mm:ss}, Epoch: {epochTime}");
+                    Console.ResetColor();
+                }
+                catch (OleDbException ex) when (ex.Message.Contains("parameter") || ex.Message.Contains("convert"))
+                {
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine("⚠ EpochTime column issue, inserting without it...");
+                    Console.ResetColor();
+
+                    string sqlNoEpoch = @"
+INSERT INTO RawData
+([DateTime],
+ [StationID 1], [DeviceID 1], [Flow], [pH], [TSS], [BOD], [COD],
+ [StationID 2], [DeviceID 2], [Flow(CWF)], [MassFlow(CSW)])
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+
+                    using var cmd2 = new OleDbCommand(sqlNoEpoch, con);
+                    cmd2.Parameters.Add("DT", OleDbType.Date).Value = measurementTime;
+                    cmd2.Parameters.Add("S1", OleDbType.VarChar).Value = hasWater ? stationId1 : (object)DBNull.Value;
+                    cmd2.Parameters.Add("D1", OleDbType.VarChar).Value = hasWater ? deviceId1 : (object)DBNull.Value;
+                    cmd2.Parameters.Add("Fl", OleDbType.Double).Value = values.TryGetValue("Unit2_Flow", out var fl) ? fl : (object)DBNull.Value;
+                    cmd2.Parameters.Add("PH", OleDbType.Double).Value = values.TryGetValue("Unit2_pH", out var ph) ? ph : (object)DBNull.Value;
+                    cmd2.Parameters.Add("TS", OleDbType.Double).Value = values.TryGetValue("Unit2_TSS", out var tss) ? tss : (object)DBNull.Value;
+                    cmd2.Parameters.Add("BD", OleDbType.Double).Value = values.TryGetValue("Unit2_BOD", out var bod) ? bod : (object)DBNull.Value;
+                    cmd2.Parameters.Add("CD", OleDbType.Double).Value = values.TryGetValue("Unit2_COD", out var cod) ? cod : (object)DBNull.Value;
+                    cmd2.Parameters.Add("S2", OleDbType.VarChar).Value = hasAir ? stationId2 : (object)DBNull.Value;
+                    cmd2.Parameters.Add("D2", OleDbType.VarChar).Value = hasAir ? deviceId2 : (object)DBNull.Value;
+                    cmd2.Parameters.Add("CWF", OleDbType.Double).Value = values.TryGetValue("Unit2_FlowCWF", out var cwf) ? cwf : (object)DBNull.Value;
+                    cmd2.Parameters.Add("CSW", OleDbType.Double).Value = values.TryGetValue("Unit2_MassFlow", out var csw) ? csw : (object)DBNull.Value;
+                    cmd2.ExecuteNonQuery();
+
+                    Console.ForegroundColor = ConsoleColor.Green;
+                    Console.WriteLine($"✓ DB INSERT OK (Unit2) - Time: {measurementTime:yyyy-MM-dd HH:mm:ss} (EpochTime skipped)");
+                    Console.ResetColor();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"❌ DB INSERT (Unit2) FAILED: {ex.Message}");
+                Console.ResetColor();
+                throw;
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        //  UpdateUnit2Row — UPDATE an already-inserted Unit 2 row
+        // ─────────────────────────────────────────────────────────────────────
+        static void UpdateUnit2Row(Dictionary<string, double> values, long epochTime,
+            string stationId1, string deviceId1,
+            string stationId2, string deviceId2,
+            bool hasWater, bool hasAir)
+        {
+            try
+            {
+                string connStr = !string.IsNullOrEmpty(Config.database?.connection_string_unit2)
+                    ? Config.database.connection_string_unit2
+                    : Config.database!.connection_string!;
+
+                using var con = new OleDbConnection(connStr);
+                con.Open();
+
+                DateTime measurementTime = epochTime > 0
+                    ? DateTimeOffset.FromUnixTimeSeconds(epochTime).LocalDateTime
+                    : DateTime.Now;
+
+                var setClauses = new List<string>();
+                var parameters = new List<(string name, OleDbType type, object val)>();
+
+                if (hasWater)
+                {
+                    setClauses.Add("[StationID 1]=?, [DeviceID 1]=?, [Flow]=?, [pH]=?, [TSS]=?, [BOD]=?, [COD]=?");
+                    parameters.Add(("S1", OleDbType.VarChar, (object)stationId1));
+                    parameters.Add(("D1", OleDbType.VarChar, (object)deviceId1));
+                    parameters.Add(("Fl", OleDbType.Double, values.TryGetValue("Unit2_Flow", out var fl) ? fl : DBNull.Value));
+                    parameters.Add(("PH", OleDbType.Double, values.TryGetValue("Unit2_pH", out var ph) ? ph : DBNull.Value));
+                    parameters.Add(("TS", OleDbType.Double, values.TryGetValue("Unit2_TSS", out var tss) ? tss : DBNull.Value));
+                    parameters.Add(("BD", OleDbType.Double, values.TryGetValue("Unit2_BOD", out var bod) ? bod : DBNull.Value));
+                    parameters.Add(("CD", OleDbType.Double, values.TryGetValue("Unit2_COD", out var cod) ? cod : DBNull.Value));
+                }
+
+                if (hasAir)
+                {
+                    setClauses.Add("[StationID 2]=?, [DeviceID 2]=?, [Flow(CWF)]=?, [MassFlow(CSW)]=?");
+                    parameters.Add(("S2", OleDbType.VarChar, (object)stationId2));
+                    parameters.Add(("D2", OleDbType.VarChar, (object)deviceId2));
+                    parameters.Add(("CWF", OleDbType.Double, values.TryGetValue("Unit2_FlowCWF", out var cwf) ? cwf : DBNull.Value));
+                    parameters.Add(("CSW", OleDbType.Double, values.TryGetValue("Unit2_MassFlow", out var csw) ? csw : DBNull.Value));
+                }
+
+                if (setClauses.Count == 0)
+                {
+                    Console.WriteLine("⚠ UPDATE skipped: no new values to set");
+                    return;
+                }
+
+                string sql = $"UPDATE RawData SET {string.Join(", ", setClauses)} WHERE [EpochTime] = ?";
+
+                try
+                {
+                    using var cmd = new OleDbCommand(sql, con);
+                    foreach (var (name, type, val) in parameters)
+                        cmd.Parameters.Add(name, type).Value = val;
+                    cmd.Parameters.Add("Ep", OleDbType.Double).Value = (double)epochTime;
+
+                    int rows = cmd.ExecuteNonQuery();
+                    LogUpdateResult(rows, epochTime, measurementTime, "Unit2 (late)");
+                    if (rows > 0) return;
+                }
+                catch (OleDbException) { /* fall through to DateTime fallback */ }
+
+                string sqlDt = $"UPDATE RawData SET {string.Join(", ", setClauses)} WHERE [DateTime] = ?";
+                using var cmd2 = new OleDbCommand(sqlDt, con);
+                foreach (var (name, type, val) in parameters)
+                    cmd2.Parameters.Add(name, type).Value = val;
+                cmd2.Parameters.Add("DT", OleDbType.Date).Value = measurementTime;
+
+                int rows2 = cmd2.ExecuteNonQuery();
+                LogUpdateResult(rows2, epochTime, measurementTime, "Unit2 (late, DateTime fallback)");
+            }
+            catch (Exception ex)
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"❌ DB UPDATE (Unit2) FAILED: {ex.Message}");
+                Console.ResetColor();
+            }
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -385,9 +925,6 @@ namespace MQTT_STA_Updater
             }
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        //  IsDeviceDuplicate — for mode 4 (per deviceId+epoch)
-        // ─────────────────────────────────────────────────────────────────────
         static bool IsDeviceDuplicate(string deviceId, long epochTime)
         {
             lock (lockObj)
@@ -424,13 +961,16 @@ namespace MQTT_STA_Updater
             }
             Config = JsonSerializer.Deserialize<ConfigRoot>(File.ReadAllText(path))!;
 
-            if (Config.output_mode < 0 || Config.output_mode > 4)
+            if (Config.output_mode < 0 || Config.output_mode > 5)
             {
-                Console.WriteLine("Invalid output_mode in config. Must be 0-4.");
+                Console.WriteLine("Invalid output_mode in config. Must be 0-5.");
                 Environment.Exit(1);
             }
         }
 
+        // ─────────────────────────────────────────────────────────────────────
+        //  ParsePayload — original format (modes 0-4)
+        // ─────────────────────────────────────────────────────────────────────
         static (Dictionary<string, double> values, long epochTime) ParsePayload(string raw)
         {
             var result = new Dictionary<string, double>();
@@ -510,14 +1050,11 @@ namespace MQTT_STA_Updater
 
         // ═════════════════════════════════════════════════════════════════════
         //  MODE 4 — DISTILLERY BUFFERING
-        //  Three payloads must all arrive before we insert one row.
-        //  Matching: EXACT epoch for the live buffer, fuzzy for late arrivals.
         // ═════════════════════════════════════════════════════════════════════
         static void BufferDistillery(long epochTime, Dictionary<string, double> values, bool isAir)
         {
             lock (lockObj)
             {
-                // ── PATH 1: Exact-epoch match in the active distillery buffer ──────────
                 if (DistilleryBufferMap.TryGetValue(epochTime, out var existing))
                 {
                     foreach (var kv in values)
@@ -527,14 +1064,10 @@ namespace MQTT_STA_Updater
                         Console.WriteLine($"  🔗 Distillery: merged {kv.Key} into buffer (epoch={epochTime})");
                         Console.ResetColor();
                     }
-
                     TryFlushDistillery(epochTime, existing);
                     return;
                 }
 
-                // ── PATH 2: Fuzzy match in active buffer (handles minor clock drift) ──
-                // Only for the active buffer — look for an entry within EpochMatchWindowSeconds
-                // that is still missing what we just received.
                 DistilleryBuffer? fuzzyMatch = null;
                 long fuzzyKey = 0;
 
@@ -543,7 +1076,6 @@ namespace MQTT_STA_Updater
                     long diff = Math.Abs(kv.Key - epochTime);
                     if (diff > 0 && diff <= EpochMatchWindowSeconds)
                     {
-                        // Check it is actually missing at least one of our values
                         bool missingAny = values.Keys.Any(k => !kv.Value.Values.ContainsKey(k));
                         if (missingAny)
                         {
@@ -568,8 +1100,6 @@ namespace MQTT_STA_Updater
                     return;
                 }
 
-                // ── PATH 3: Late arrival — row was already flushed solo ───────────────
-                // Find a flushed solo record missing exactly what we just received.
                 DistilleryFlushedRecord? flushedMatch = null;
                 long flushedKey = 0;
 
@@ -607,7 +1137,6 @@ namespace MQTT_STA_Updater
                     return;
                 }
 
-                // ── PATH 4: No match — new buffer entry ───────────────────────────────
                 var newBuf = new DistilleryBuffer
                 {
                     EpochTime = epochTime,
@@ -625,14 +1154,8 @@ namespace MQTT_STA_Updater
             }
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        //  TryFlushDistillery — insert once all 3 values have arrived
-        // ─────────────────────────────────────────────────────────────────────
-        static Dictionary<long, DistilleryFlushedRecord> DistilleryFlushedRecords = new();
-
         static void TryFlushDistillery(long epochKey, DistilleryBuffer buf)
         {
-            // Must be called inside lockObj
             bool hasFeed = buf.Values.ContainsKey("Evaporator_Feed_Flow");
             bool hasConc = buf.Values.ContainsKey("Evaporator_Concentrate_Flow");
             bool hasSPM = buf.Values.ContainsKey("Boiler_Stack_SPM");
@@ -650,16 +1173,8 @@ namespace MQTT_STA_Updater
                 InsertDistillery(buf.Values, epochKey);
                 DistilleryBufferMap.Remove(epochKey);
             }
-            else
-            {
-                // Not yet complete — check if we should also register as partial flushed record
-                // (timer will handle timeout flushing separately)
-            }
         }
 
-        // ─────────────────────────────────────────────────────────────────────
-        //  UpdateDistilleryRow — UPDATE an already-inserted distillery row
-        // ─────────────────────────────────────────────────────────────────────
         static void UpdateDistilleryRow(Dictionary<string, double> values, long epochTime)
         {
             try
@@ -671,7 +1186,6 @@ namespace MQTT_STA_Updater
                     ? DateTimeOffset.FromUnixTimeSeconds(epochTime).LocalDateTime
                     : DateTime.Now;
 
-                // Build SET clause dynamically: only update columns that have new data
                 var setClauses = new List<string>();
                 var parameters = new List<(string name, OleDbType type, object val)>();
 
@@ -715,9 +1229,8 @@ namespace MQTT_STA_Updater
                     LogUpdateResult(rows, epochTime, measurementTime, "Distillery (late)");
                     if (rows > 0) return;
                 }
-                catch (OleDbException) { /* fall through to DateTime fallback */ }
+                catch (OleDbException) { }
 
-                // Fallback: match by DateTime
                 string sqlDt = $"UPDATE RawData SET {string.Join(", ", setClauses)} WHERE [DateTime] = ?";
                 using var cmd2 = new OleDbCommand(sqlDt, con);
                 foreach (var (name, type, val) in parameters)
@@ -736,8 +1249,7 @@ namespace MQTT_STA_Updater
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  CHANGE 3: FlushOldBufferedData — timer fires every 60s
-        //  Wrapped entire body in try-catch to prevent silent timer death
+        //  FlushOldBufferedData — timer fires every 60s
         // ─────────────────────────────────────────────────────────────────────
         static void FlushOldBufferedData(object? sender, ElapsedEventArgs e)
         {
@@ -766,7 +1278,6 @@ namespace MQTT_STA_Updater
                         DataBuffer.Remove(epochTime);
                     }
 
-                    // ── Prune expired standard solo records ──────────────────────────────
                     var toExpire = FlushedSoloRecords
                         .Where(kv => (now - kv.Value.FlushedAt).TotalSeconds >= LateArrivalWindowSeconds)
                         .Select(kv => kv.Key).ToList();
@@ -796,7 +1307,6 @@ namespace MQTT_STA_Updater
 
                         InsertDistillery(buf.Values, epochTime);
 
-                        // Register as flushed solo so late arrivals can UPDATE
                         var flushed = new DistilleryFlushedRecord
                         {
                             EpochTime = epochTime,
@@ -809,7 +1319,6 @@ namespace MQTT_STA_Updater
                         DistilleryBufferMap.Remove(epochTime);
                     }
 
-                    // ── Prune expired distillery flushed records ─────────────────────────
                     var distilleryToExpire = DistilleryFlushedRecords
                         .Where(kv => (now - kv.Value.FlushedAt).TotalSeconds >= LateArrivalWindowSeconds)
                         .Select(kv => kv.Key).ToList();
@@ -818,11 +1327,37 @@ namespace MQTT_STA_Updater
                         Console.WriteLine($"  🗑 Distillery: Expired late-arrival window for epoch={key}");
                         DistilleryFlushedRecords.Remove(key);
                     }
+
+                    // ── Flush timed-out Unit 2 buffer entries (mode 5) ───────────────────
+                    var unit2ToFlush = Unit2BufferMap
+                        .Where(kv => (now - kv.Value.ReceivedAt).TotalSeconds >= FlushDelaySeconds)
+                        .Select(kv => kv.Key).ToList();
+
+                    foreach (var epochTime in unit2ToFlush)
+                    {
+                        var buf = Unit2BufferMap[epochTime];
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                        Console.WriteLine($"\n⚠ UNIT2 TIMEOUT ({FlushDelaySeconds}s): epoch={epochTime}");
+                        Console.WriteLine($"  HasWater={buf.HasWater}, HasAir={buf.HasAir}");
+                        Console.WriteLine($"  Inserting partial row. Late arrival can UPDATE for {LateArrivalWindowSeconds}s.");
+                        Console.ResetColor();
+
+                        FlushUnit2Buffer(epochTime, buf);
+                        Unit2BufferMap.Remove(epochTime);
+                    }
+
+                    var unit2ToExpire = Unit2FlushedRecords
+                        .Where(kv => (now - kv.Value.FlushedAt).TotalSeconds >= LateArrivalWindowSeconds)
+                        .Select(kv => kv.Key).ToList();
+                    foreach (var key in unit2ToExpire)
+                    {
+                        Console.WriteLine($"  🗑 Unit2: Expired late-arrival window for epoch={key}");
+                        Unit2FlushedRecords.Remove(key);
+                    }
                 }
             }
             catch (Exception ex)
             {
-                // Without this catch, any exception here silently kills the timer forever
                 Console.ForegroundColor = ConsoleColor.Red;
                 Console.WriteLine($"❌ ERROR in flush timer: {ex.Message}");
                 Console.ResetColor();
@@ -830,7 +1365,7 @@ namespace MQTT_STA_Updater
         }
 
         // ═════════════════════════════════════════════════════════════════════
-        //  MODES 0-3 BUFFER LOGIC (unchanged from original)
+        //  MODES 0-3 BUFFER LOGIC
         // ═════════════════════════════════════════════════════════════════════
         static void BufferData(long epochTime, Dictionary<string, double> values, bool isWater)
         {
@@ -838,7 +1373,6 @@ namespace MQTT_STA_Updater
             {
                 string side = isWater ? "WATER" : "AIR";
 
-                // PATH 1: Exact-epoch match in active buffer
                 BufferedData? matchedBuffer = null;
                 long matchedKey = 0;
 
@@ -884,7 +1418,6 @@ namespace MQTT_STA_Updater
                     return;
                 }
 
-                // PATH 2: Late arrival — already flushed solo
                 FlushedRecord? flushedMatch = null;
                 long flushedMatchKey = 0;
 
@@ -931,7 +1464,6 @@ namespace MQTT_STA_Updater
                     return;
                 }
 
-                // PATH 3: No match — new buffer entry
                 if (DataBuffer.TryGetValue(epochTime, out var existingEntry))
                 {
                     bool alreadyHasThisSide = isWater ? existingEntry.HasWater : existingEntry.HasAir;
@@ -1119,7 +1651,7 @@ WHERE [EpochTime]=?";
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        //  InsertCombined — modes 0-3 (unchanged schema)
+        //  InsertCombined — modes 0-3
         // ─────────────────────────────────────────────────────────────────────
         static void InsertCombined(Dictionary<string, double> values,
                                    long epochTime, bool hasWater, bool hasAir)
@@ -1171,7 +1703,6 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
                 }
                 catch (OleDbException ex) when (ex.Message.Contains("parameter") || ex.Message.Contains("convert"))
                 {
-                    // Retry without EpochTime column
                     Console.ForegroundColor = ConsoleColor.Yellow;
                     Console.WriteLine("⚠ EpochTime column issue, inserting without it...");
                     Console.ResetColor();
@@ -1220,9 +1751,6 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 
         // ─────────────────────────────────────────────────────────────────────
         //  InsertDistillery — mode 4 ONLY
-        //  DB schema: ID | DateTime | EpochTime | DeviceID 1 | Evaportar Feed Flow
-        //             | DeviceID 2 | Evaportar Concentrate Flow | DeviceID 3 | SPM
-        //  NOTE: Access field names match the screenshot exactly (typo "Evaportar" included).
         // ─────────────────────────────────────────────────────────────────────
         static void InsertDistillery(Dictionary<string, double> values, long epochTime)
         {
@@ -1241,7 +1769,6 @@ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
 
                 try
                 {
-                    // ── Primary INSERT with EpochTime ─────────────────────────────
                     string sql = @"
 INSERT INTO RawData
 ([DateTime], [EpochTime],
@@ -1268,7 +1795,6 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
                 }
                 catch (OleDbException ex) when (ex.Message.Contains("parameter") || ex.Message.Contains("convert"))
                 {
-                    // ── Fallback INSERT without EpochTime ─────────────────────────
                     Console.ForegroundColor = ConsoleColor.Yellow;
                     Console.WriteLine("⚠ EpochTime column issue, inserting without it...");
                     Console.ResetColor();
@@ -1306,7 +1832,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?)";
         }
 
         // ═════════════════════════════════════════════════════════════════════
-        //  FILE UPDATE METHODS (unchanged)
+        //  FILE UPDATE METHODS
         // ═════════════════════════════════════════════════════════════════════
         static void UpdateStaFile(string filePath,
             Dictionary<string, (string nmes, string name)> mapping,
@@ -1407,6 +1933,25 @@ VALUES (?, ?, ?, ?, ?, ?, ?)";
             Console.ResetColor();
         }
 
+        static void UpdateTextFileUnit2(string filePath, Dictionary<string, double> values)
+        {
+            if (!File.Exists(filePath)) { Console.WriteLine($"⚠ Text file (Unit 2) not found: {filePath}"); return; }
+            string content = File.ReadAllText(filePath);
+
+            content = UpdateTextValue(content, @"COD\s+(\S+)\s+mg/l", values.TryGetValue("Unit2_COD", out var cod) ? cod.ToString("0.00") : "NA");
+            content = UpdateTextValue(content, @"BOD\s+(\S+)\s+mg/l", values.TryGetValue("Unit2_BOD", out var bod) ? bod.ToString("0.00") : "NA");
+            content = UpdateTextValue(content, @"TSS\s+(\S+)\s+mg/l", values.TryGetValue("Unit2_TSS", out var tss) ? tss.ToString("0.00") : "NA");
+            content = UpdateTextValue(content, @"pH\s+(\S+)\s+pH", values.TryGetValue("Unit2_pH", out var ph) ? ph.ToString("0.00") : "NA");
+            content = UpdateTextValue(content, @"ETP Flow\s+(\S+)\s+m3/hr", values.TryGetValue("Unit2_Flow", out var fl) ? fl.ToString("0.00") : "NA");
+            content = UpdateTextValue(content, @"CWF Flow\s+(\S+)\s+m3/hr", values.TryGetValue("Unit2_FlowCWF", out var cwf) ? cwf.ToString("0.00") : "NA");
+            content = UpdateTextValue(content, @"MassFlow\s+(\S+)\s+Kg/Hr", values.TryGetValue("Unit2_MassFlow", out var mf) ? mf.ToString("0.00") : "NA");
+
+            File.WriteAllText(filePath, content);
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine($"✓ Text File (Unit 2) Updated: {Path.GetFileName(filePath)}");
+            Console.ResetColor();
+        }
+
         static string UpdateTextValue(string content, string pattern, string newValue)
             => Regex.Replace(content, pattern, m => m.Value.Replace(m.Groups[1].Value, newValue));
     }
@@ -1440,26 +1985,46 @@ VALUES (?, ?, ?, ?, ?, ?, ?)";
     // ═════════════════════════════════════════════════════════════════════════
     //  DISTILLERY BUFFER CLASSES (mode 4)
     // ═════════════════════════════════════════════════════════════════════════
-
-    /// <summary>
-    /// Live buffer: accumulates Feed Flow + Concentrate Flow + SPM until all arrive.
-    /// </summary>
     class DistilleryBuffer
     {
         public long EpochTime { get; set; }
         public DateTime ReceivedAt { get; set; }
-        /// <summary>All values collected so far, keyed by deviceId.</summary>
         public Dictionary<string, double> Values { get; set; } = new();
     }
 
-    /// <summary>
-    /// Tracks a distillery row that was already INSERT-ed (partially or fully),
-    /// so a late-arriving payload can UPDATE it instead of creating a new row.
-    /// </summary>
     class DistilleryFlushedRecord
     {
         public long EpochTime { get; set; }
         public DateTime FlushedAt { get; set; }
+        public Dictionary<string, double> Values { get; set; } = new();
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    //  UNIT 2 BUFFER CLASSES (mode 5)
+    // ═════════════════════════════════════════════════════════════════════════
+    class Unit2Buffer
+    {
+        public long EpochTime { get; set; }
+        public DateTime ReceivedAt { get; set; }
+        public bool HasWater { get; set; } = false;
+        public bool HasAir { get; set; } = false;
+        public string StationID1 { get; set; } = "";
+        public string DeviceID1 { get; set; } = "";
+        public string StationID2 { get; set; } = "";
+        public string DeviceID2 { get; set; } = "";
+        public Dictionary<string, double> Values { get; set; } = new();
+    }
+
+    class Unit2FlushedRecord
+    {
+        public long EpochTime { get; set; }
+        public DateTime FlushedAt { get; set; }
+        public bool HasWater { get; set; } = false;
+        public bool HasAir { get; set; } = false;
+        public string StationID1 { get; set; } = "";
+        public string DeviceID1 { get; set; } = "";
+        public string StationID2 { get; set; } = "";
+        public string DeviceID2 { get; set; } = "";
         public Dictionary<string, double> Values { get; set; } = new();
     }
 
@@ -1491,11 +2056,13 @@ VALUES (?, ?, ?, ?, ?, ?, ?)";
         public string? display_text_unit1 { get; set; }
         public string? display_text_unit5 { get; set; }
         public string? display_text_distillery { get; set; }
+        public string? display_text_unit2 { get; set; }
     }
 
     class DatabaseConfig
     {
         public string? connection_string { get; set; }
+        public string? connection_string_unit2 { get; set; }
     }
 
     class ParamConfig

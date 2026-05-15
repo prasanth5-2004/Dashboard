@@ -1,27 +1,61 @@
 {
-  "_comment": "Output modes: 0=unit4 STA, 1=Unit1 text, 2=STA+Unit4 text, 3=Unit5 text, 4=Distillery text+DB",
-  "output_mode": 4,
-  "mqtt": {
-    "broker": "1.6.37.192",
-    "port": 1883,
-    "topic_water": "water/data",
-    "topic_air": "air/data"
-  },
-  "files": {
-    "water": "",
-    "air": "",
-    "display_text_unit1": "",
-    "display_text_unit5": "",
-    "display_text_distillery": "C:\\Projects\\pollution\\Distillary\\Display.txt"
-  },
-  "database": {
-    "connection_string": "Provider=Microsoft.ACE.OLEDB.16.0;Data Source=C:\\Data4\\pollution1.accdb;Persist Security Info=False;"
-  },
-  "water_parameters": {
-    "FeedFlow": { "deviceId": "Evaporator_Feed_Flow",       "nmes": "" },
-    "ConcFlow": { "deviceId": "Evaporator_Concentrate_Flow","nmes": "" }
-  },
-  "air_parameters": {
-    "SPM": { "deviceId": "Boiler_Stack_SPM", "nmes": "" }
-  }
+    "_comment_modes": "Output modes: 0=Unit4 STA only, 1=Unit1 text only, 2=STA+Unit1 text, 3=Unit5 text only, 4=Distillery text+DB, 5=Unit2 ETP+CWF/CSW DB",
+    "output_mode": 5,
+
+    "mqtt": {
+        "broker": "sithesmqtt.lantratech.com",
+        "port": 1883,
+        "topic_water": "ICG3/38/sync",
+        "topic_air": "ICG3/42/sync"
+    },
+
+    "files": {
+        "_comment": "For mode 5, only display_text_unit2 is used (optional). Leave others empty.",
+        "water": "",
+        "air": "",
+        "display_text_unit1": "",
+        "display_text_unit5": "",
+        "display_text_distillery": "",
+        "display_text_unit2": "C:\\Projects\\pollution\\Unit2\\Display.txt"
+    },
+
+    "database": {
+        "_comment": "connection_string_unit2 is used when output_mode=5. connection_string is used for modes 0-4.",
+        "connection_string": "",
+        "connection_string_unit2": "Provider=Microsoft.ACE.OLEDB.16.0;Data Source=C:\\Data4\\pollution2.accdb;Persist Security Info=False;"
+    },
+
+    "_comment_unit2_params": "For mode 5, water_parameters and air_parameters are informational only (payload is parsed by parameter name, not deviceId).",
+    "water_parameters": {
+        "ETP_Flow": {
+            "deviceId": "device_14075",
+            "nmes": ""
+        },
+        "ETP_pH": {
+            "deviceId": "device_14075",
+            "nmes": ""
+        },
+        "ETP_TSS": {
+            "deviceId": "device_14075",
+            "nmes": ""
+        },
+        "ETP_BOD": {
+            "deviceId": "device_14075",
+            "nmes": ""
+        },
+        "ETP_COD": {
+            "deviceId": "device_14075",
+            "nmes": ""
+        }
+    },
+    "air_parameters": {
+        "CWF_Flow": {
+            "deviceId": "device_14077",
+            "nmes": ""
+        },
+        "CSW_MassFlow": {
+            "deviceId": "device_14077",
+            "nmes": ""
+        }
+    }
 }

@@ -14,7 +14,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("pollution")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+e16c6f58f335ec6485f0a053e049dba2c5115a1a")]
 [assembly: System.Reflection.AssemblyProductAttribute("pollution")]
 [assembly: System.Reflection.AssemblyTitleAttribute("pollution")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]

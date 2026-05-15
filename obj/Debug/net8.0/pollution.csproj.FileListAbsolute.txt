@@ -28,3 +28,4 @@ C:\Projects\pollution\obj\Debug\net8.0\refint\pollution.dll
 C:\Projects\pollution\obj\Debug\net8.0\pollution.pdb
 C:\Projects\pollution\obj\Debug\net8.0\pollution.genruntimeconfig.cache
 C:\Projects\pollution\obj\Debug\net8.0\ref\pollution.dll
+C:\Projects\pollution\obj\Debug\net8.0\pollution.sourcelink.json
