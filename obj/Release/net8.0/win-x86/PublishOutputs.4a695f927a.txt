@@ -1,0 +1,3 @@
+C:\Projects\pollution\bin\Release\net8.0\win-x86\publish\pollution.pdb
+C:\Projects\pollution\bin\Release\net8.0\win-x86\publish\config.json
+C:\Projects\pollution\bin\Release\net8.0\win-x86\publish\pollution.exe

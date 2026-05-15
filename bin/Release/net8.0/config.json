@@ -1,0 +1,27 @@
+{
+  "mqtt": {
+    "broker": "sithesmqtt.lantratech.com",
+    "port": 1883,
+    "topic_water": "ICG3/34/sync",
+    "topic_air": "ICG3/35/sync"
+  },
+
+  "files": {
+    "water": "Display_Pollution.STA",
+    "air": "Display_Air.STA"
+  },
+
+  "water_parameters": {
+    "Flow": { "deviceId": "ETP_Outlet_Flow", "nmes": "1" },
+    "pH":   { "deviceId": "ETP_Outlet_pH",   "nmes": "2" },
+    "TSS":  { "deviceId": "ETP_Outlet_TSS",  "nmes": "5" },
+    "BOD":  { "deviceId": "ETP_Outlet_BOD",  "nmes": "3" },
+    "COD":  { "deviceId": "ETP_Outlet_COD",  "nmes": "4" }
+  },
+
+  "air_parameters": {
+    "SO2": { "deviceId": "Stack_SO2", "nmes": "2" },
+    "NOx": { "deviceId": "Stack_NOx", "nmes": "3" },
+    "SPM": { "deviceId": "Stack_SPM", "nmes": "4" }
+  }
+}
